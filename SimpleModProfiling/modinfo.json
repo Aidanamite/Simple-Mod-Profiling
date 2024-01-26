@@ -1,0 +1,14 @@
+{
+  "name": "Simple Mod Profiling",
+  "author": "Aidanamite",
+  "description": "A handy little lag debugging tool",
+  "version": "1.0.0",
+  "license": "GNU AGPLv3",
+  "icon": "icon.png",
+  "banner": "banner.jpg",
+  "gameVersion": "1.0",
+  "requiredByAllPlayers": false,
+  "updateUrl": "https://www.raftmodding.com/api/v1/mods/simple-mod-profiling/version.txt",
+  "isModPermanent": false,
+  "excludedFiles": []
+}

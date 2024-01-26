@@ -1,0 +1,212 @@
+﻿using HarmonyLib;
+using HMLLibrary;
+using RaftModLoader;
+using Steamworks;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Reflection.Emit;
+using UnityEngine;
+using UnityEngine.UI;
+using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.Threading;
+using System.Text;
+using Debug = UnityEngine.Debug;
+using Object = UnityEngine.Object;
+
+
+namespace SimpleModProfiling
+{
+    public class Main : Mod
+    {
+        public static Main instance;
+        public static Thread mainThread;
+        Harmony harmony;
+
+        public void Start()
+        {
+            mainThread = Thread.CurrentThread;
+            instance = this;
+            harmony = new Harmony("com.aidanamite.SimpleModProfiling");
+            foreach (var m in Patch_Updates.TargetMethods())
+                try
+                {
+                    harmony.Patch(m, new HarmonyMethod(typeof(Patch_Updates), "Prefix"), finalizer: new HarmonyMethod(typeof(Patch_Updates), "Finalizer"));
+                }
+                catch { }
+            Log("Mod has been loaded!");
+        }
+
+        public void OnModUnload()
+        {
+            Patch_Updates.logging = false;
+            harmony.UnpatchAll(harmony.Id);
+            Log("Mod has been unloaded!");
+        }
+
+        [ConsoleCommand(name: "ProfileMods", docs: "")]
+        public static string MyCommand(string[] args)
+        {
+            instance.StartCoroutine(GetLog(double.Parse(args[0])));
+            return "Started";
+        }
+        [ConsoleCommand(name: "CancelProfile", docs: "")]
+        public static string MyCommand2(string[] args)
+        {
+            if (!Patch_Updates.logging)
+                return "Not currently profiling. Cannot cancel";
+            Patch_Updates.logging = false;
+            return "Profiling canceled";
+        }
+        static IEnumerator GetLog(double time)
+        {
+            var s = DateTime.UtcNow.AddSeconds(time);
+            Patch_Updates.logging = true;
+            while (DateTime.UtcNow < s && Patch_Updates.logging)
+                yield return new WaitForEndOfFrame();
+            Patch_Updates.logging = false;
+            var sum = 0d;
+            var sums = new Dictionary<Mod, Su>();
+            foreach (var i in Patch_Updates.log)
+                if (Patch_Updates.associate.TryGetValue(i.Key.GetTop().DeclaringType, out var mo))
+                {
+                    var me = Patch_Updates.originals.TryGetValue(i.Key.GetTop(), out var n) ? n : i.Key.GetTop();
+                    if (!sums.TryGetValue(mo, out var v))
+                        sums[mo] = v = new Su();
+                    sum += i.Value;
+                    v.sum += i.Value;
+                    v.items.Add((i.Value, me));
+                }
+            var l = sums.ToList();
+            l.Sort((x, y) => y.Value.sum.CompareTo(x.Value.sum));
+            var t = new StringBuilder("Profiling Complete!\nTotal: ");
+            t.Append(sum);
+            t.Append("ms");
+            foreach (var p in l)
+            {
+                t.Append("\n ├─[");
+                t.Append(p.Key.name);
+                t.Append("] Total: ");
+                t.Append(p.Value.sum);
+                t.Append("ms");
+                p.Value.items.Sort((x, y) => y.Item1.CompareTo(x.Item1));
+                foreach (var i in p.Value.items)
+                {
+                    t.Append("\n ├───[");
+                    t.Append(i.Item2.DeclaringType);
+                    t.Append("::");
+                    t.Append(i.Item2);
+                    t.Append("] = ");
+                    t.Append(i.Item1);
+                    t.Append("ms");
+                }
+            }
+            Debug.Log(t.ToString());
+            Patch_Updates.log.Clear();
+            yield break;
+        }
+
+        class Su
+        {
+            public double sum = 0;
+            public List<(double, MethodBase)> items = new List<(double, MethodBase)>();
+        }
+    }
+
+    public class HashableStackTrace
+    {
+        public readonly StackTrace trace = new StackTrace(2);
+        public HashableStackTrace() { }
+        public override bool Equals(object obj)
+        {
+            var o = obj is HashableStackTrace h ? h.trace : obj is StackTrace t ? t : null;
+            if (o != null)
+                return Equals(trace, o);
+            return base.Equals(obj);
+        }
+        public override int GetHashCode() => GetHashCode(trace);
+        public MethodBase GetTop() => trace.GetFrame(0)?.GetMethod();
+        public static int GetHashCode(StackFrame obj) => (obj.GetMethod()?.GetHashCode() ?? 0) ^ obj.GetNativeOffset();
+        public static bool Equals(StackFrame a, StackFrame b)
+        {
+            var aM = a.GetMethod();
+            var bM = b.GetMethod();
+            if (aM != bM)
+                return false;
+            if (a.GetNativeOffset() != b.GetNativeOffset())
+                return false;
+            return true;
+        }
+        public static int GetHashCode(StackTrace obj)
+        {
+            var r = 0;
+            foreach (var f in obj.GetFrames())
+                r ^= GetHashCode(f);
+            return r;
+        }
+        public static bool Equals(StackTrace a, StackTrace b)
+        {
+            var c = a.FrameCount;
+            if (c != b.FrameCount)
+                return false;
+            for (int i = 0; i < c; i++)
+                if (!Equals(a.GetFrame(i), b.GetFrame(i)))
+                    return false;
+            return true;
+        }
+        public static bool operator ==(HashableStackTrace a, HashableStackTrace b) => a.Equals(b);
+        public static bool operator !=(HashableStackTrace a, HashableStackTrace b) => !(a == b);
+        public override string ToString() => trace.ToString();
+    }
+
+    static class Patch_Updates
+    {
+        public static Dictionary<Type, Mod> associate = new Dictionary<Type, Mod>();
+        public static Dictionary<MethodBase, MethodBase> originals = new Dictionary<MethodBase, MethodBase>();
+
+        public static bool logging = false;
+        public static ConcurrentDictionary<HashableStackTrace, double> log = new ConcurrentDictionary<HashableStackTrace, double>();
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            associate.Clear();
+            var l = new List<MethodBase>();
+            foreach (var mod in ModManagerPage.activeModInstances)
+                if (mod && mod != Main.instance)
+                    try
+                    {
+                        foreach (var j in mod.GetType().Assembly.GetTypes())
+                        {
+                            associate[j] = mod;
+                            if (!j.ContainsGenericParameters)
+                                foreach (var m in j.GetMethods(~BindingFlags.Default))
+                                    if (m.HasMethodBody() && !m.ContainsGenericParameters)
+                                        l.Add(m);
+                        }
+                    }
+                    catch { }
+            return l;
+        }
+        static DateTime? start = null;
+        public static void Prefix(out bool __state)
+        {
+            if (__state = (logging && start == null && Main.mainThread == Thread.CurrentThread))
+                start = DateTime.UtcNow;
+        }
+        public static void Finalizer(bool __state, MethodBase __originalMethod)
+        {
+            if (__state)
+            {
+                var end = DateTime.UtcNow;
+                var trace = new HashableStackTrace();
+                log.TryGetValue(trace, out var s);
+                log[trace] = s + (end - start.Value).TotalMilliseconds;
+                start = null;
+                originals[trace.GetTop()] = __originalMethod;
+            }
+        }
+    }
+}
